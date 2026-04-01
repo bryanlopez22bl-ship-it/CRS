@@ -1,0 +1,16 @@
+[Unit]
+Description=Swipe App for Raspberry Pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pi_supabase_swipe_app
+ExecStart=/usr/bin/python3 /home/pi/pi_supabase_swipe_app/main.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/pi/pi_supabase_swipe_app/.env
+
+[Install]
+WantedBy=multi-user.target
