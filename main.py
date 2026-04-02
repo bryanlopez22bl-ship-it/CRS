@@ -1,16 +1,13 @@
+cat > main.py <<'PY'
 import os
 import re
 import time
 import threading
 from datetime import datetime, date, time as dt_time
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from dotenv import load_dotenv
-from supabase import create_client, Client
-
-# =========================
-# Environment / Config
-# =========================
+from supabase import create_client
 
 load_dotenv()
 
@@ -20,44 +17,30 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY in .env")
 
-# Existing tables
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 STUDENTS_TABLE = "students_nokey"
 HISTORY_TABLE = "student_status_history_nokey"
 
-# Auto-close today's open records after this time
 AUTO_CLOSE_HOUR = int(os.getenv("AUTO_CLOSE_HOUR", "23"))
 AUTO_CLOSE_MINUTE = int(os.getenv("AUTO_CLOSE_MINUTE", "59"))
-
-# How often to check whether end-of-day auto-close should run
 AUTO_CLOSE_CHECK_SECONDS = int(os.getenv("AUTO_CLOSE_CHECK_SECONDS", "30"))
 
-# LED settings
 ENABLE_LED = os.getenv("ENABLE_LED", "true").lower() == "true"
 LED_PIN = int(os.getenv("LED_PIN", "18"))
-
-# ID format constraint from your DB
-ID_REGEX = re.compile(r"\d{10}")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-# =========================
-# Optional Raspberry Pi LED
-# =========================
 
 GPIO_READY = False
 
 if ENABLE_LED:
     try:
         import RPi.GPIO as GPIO
-
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(LED_PIN, GPIO.OUT)
         GPIO.output(LED_PIN, GPIO.LOW)
         GPIO_READY = True
     except Exception as e:
-        print(f"[WARN] GPIO unavailable, LED disabled: {e}")
+        print(f"[WARN] GPIO disabled: {e}")
         GPIO_READY = False
 
 
@@ -95,16 +78,8 @@ def cleanup_gpio() -> None:
         GPIO.cleanup()
 
 
-# =========================
-# Helpers
-# =========================
-
 def now_local() -> datetime:
     return datetime.now()
-
-
-def today_local() -> date:
-    return now_local().date()
 
 
 def iso_now() -> str:
@@ -117,13 +92,12 @@ def end_of_day_iso(d: date) -> str:
 
 def extract_student_id(raw_swipe: str) -> Optional[str]:
     """
-    Extract exactly one 10-digit ID from the swiper input.
-    Returns the first 10-digit match.
+    Extract the first 10-digit student ID from the swipe input.
     """
     if not raw_swipe:
         return None
 
-    match = ID_REGEX.search(raw_swipe)
+    match = re.search(r"\d{10}", raw_swipe)
     if match:
         return match.group(0)
 
@@ -133,18 +107,14 @@ def extract_student_id(raw_swipe: str) -> Optional[str]:
 def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00").replace("+00:00", ""))
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned).replace(tzinfo=None)
+    except ValueError:
+        return None
 
 
-def is_same_local_day(dt_value: datetime, day_value: date) -> bool:
-    return dt_value.date() == day_value
-
-
-# =========================
-# Database functions
-# =========================
-
-def get_student_record(student_id: str) -> Optional[Dict[str, Any]]:
+def get_student_record(student_id: str):
     response = (
         supabase.table(STUDENTS_TABLE)
         .select("*")
@@ -156,18 +126,14 @@ def get_student_record(student_id: str) -> Optional[Dict[str, Any]]:
     return data[0] if data else None
 
 
-def ensure_student_row_exists(student_id: str) -> Dict[str, Any]:
-    """
-    Makes sure the student exists in students_nokey so the history FK is satisfied.
-    Uses upsert with only id/check_in_at/check_out_at.
-    """
+def ensure_student_exists(student_id: str) -> None:
     existing = get_student_record(student_id)
     if existing:
-        return existing
+        return
 
-    response = (
+    (
         supabase.table(STUDENTS_TABLE)
-        .upsert({
+        .insert({
             "id": student_id,
             "check_in_at": None,
             "check_out_at": None
@@ -175,23 +141,8 @@ def ensure_student_row_exists(student_id: str) -> Dict[str, Any]:
         .execute()
     )
 
-    data = response.data or []
-    if data:
-        return data[0]
-
-    # fallback re-read
-    existing = get_student_record(student_id)
-    if not existing:
-        raise RuntimeError(f"Unable to create or fetch student row for {student_id}")
-    return existing
-
 
 def log_status(student_id: str, status: str, timestamp_iso: str) -> None:
-    """
-    status must be:
-      - checked_in
-      - checked_out
-    """
     if status not in ("checked_in", "checked_out"):
         raise ValueError(f"Invalid status: {status}")
 
@@ -206,32 +157,47 @@ def log_status(student_id: str, status: str, timestamp_iso: str) -> None:
     )
 
 
-def update_student_times(student_id: str, check_in_at: Optional[str], check_out_at: Optional[str]) -> None:
-    payload: Dict[str, Any] = {}
+def check_in(student_id: str) -> None:
+    timestamp = iso_now()
 
-    if check_in_at is not None:
-        payload["check_in_at"] = check_in_at
-
-    # allow explicit null on check_out_at
-    payload["check_out_at"] = check_out_at
+    ensure_student_exists(student_id)
 
     (
         supabase.table(STUDENTS_TABLE)
-        .update(payload)
+        .update({
+            "check_in_at": timestamp,
+            "check_out_at": None
+        })
         .eq("id", student_id)
         .execute()
     )
 
+    log_status(student_id, "checked_in", timestamp)
+    print(f"[OK] {student_id} -> checked_in at {timestamp}")
+    success_blink()
 
-# =========================
-# Business logic
-# =========================
+
+def check_out(student_id: str, timestamp: Optional[str] = None) -> None:
+    if timestamp is None:
+        timestamp = iso_now()
+
+    ensure_student_exists(student_id)
+
+    (
+        supabase.table(STUDENTS_TABLE)
+        .update({
+            "check_out_at": timestamp
+        })
+        .eq("id", student_id)
+        .execute()
+    )
+
+    log_status(student_id, "checked_out", timestamp)
+    print(f"[OK] {student_id} -> checked_out at {timestamp}")
+    success_blink()
+
 
 def close_stale_open_record_for_student(student_id: str) -> bool:
-    """
-    If the student is still checked in from a previous day, auto-close that old session
-    at that prior day's configured end-of-day time and log checked_out history.
-    """
     student = get_student_record(student_id)
     if not student:
         return False
@@ -246,70 +212,32 @@ def close_stale_open_record_for_student(student_id: str) -> bool:
     if check_in_dt is None:
         return False
 
-    if is_same_local_day(check_in_dt, today_local()):
+    today = now_local().date()
+    if check_in_dt.date() == today:
         return False
 
-    auto_close_timestamp = end_of_day_iso(check_in_dt.date())
+    close_ts = end_of_day_iso(check_in_dt.date())
 
-    update_student_times(
-        student_id=student_id,
-        check_in_at=None,
-        check_out_at=auto_close_timestamp
+    (
+        supabase.table(STUDENTS_TABLE)
+        .update({
+            "check_out_at": close_ts
+        })
+        .eq("id", student_id)
+        .execute()
     )
 
-    log_status(student_id, "checked_out", auto_close_timestamp)
+    log_status(student_id, "checked_out", close_ts)
     return True
 
 
-def check_in(student_id: str) -> None:
-    timestamp = iso_now()
-
-    ensure_student_row_exists(student_id)
-
-    update_student_times(
-        student_id=student_id,
-        check_in_at=timestamp,
-        check_out_at=None
-    )
-
-    log_status(student_id, "checked_in", timestamp)
-
-    print(f"[OK] {student_id} -> checked_in at {timestamp}")
-    success_blink()
-
-
-def check_out(student_id: str) -> None:
-    timestamp = iso_now()
-
-    ensure_student_row_exists(student_id)
-
-    update_student_times(
-        student_id=student_id,
-        check_in_at=None,
-        check_out_at=timestamp
-    )
-
-    log_status(student_id, "checked_out", timestamp)
-
-    print(f"[OK] {student_id} -> checked_out at {timestamp}")
-    success_blink()
-
-
 def process_swipe(student_id: str) -> None:
-    """
-    Rules:
-    - If no current row exists or no active open session: checked_in
-    - If currently checked in today and not checked out yet: checked_out
-    - If stale open session exists from a prior day: close it first, then checked_in
-    """
-    ensure_student_row_exists(student_id)
-
-    # Close stale previous-day session if needed
+    ensure_student_exists(student_id)
     close_stale_open_record_for_student(student_id)
 
     student = get_student_record(student_id)
     if not student:
-        raise RuntimeError(f"Student record missing after ensure step for {student_id}")
+        raise RuntimeError("Could not fetch student record.")
 
     check_in_raw = student.get("check_in_at")
     check_out_raw = student.get("check_out_at")
@@ -320,22 +248,18 @@ def process_swipe(student_id: str) -> None:
 
     check_in_dt = parse_iso_datetime(check_in_raw)
     if check_in_dt is None:
-        raise RuntimeError(f"Invalid check_in_at value for {student_id}: {check_in_raw}")
+        raise RuntimeError(f"Invalid check_in_at for {student_id}")
 
-    # If checked in today and still open, then this swipe is an OUT
-    if check_out_raw is None and is_same_local_day(check_in_dt, today_local()):
+    today = now_local().date()
+
+    if check_out_raw is None and check_in_dt.date() == today:
         check_out(student_id)
         return
 
-    # Otherwise start a fresh session
     check_in(student_id)
 
 
-# =========================
-# Auto-close routines
-# =========================
-
-def get_all_open_student_rows() -> List[Dict[str, Any]]:
+def get_all_open_rows():
     response = (
         supabase.table(STUDENTS_TABLE)
         .select("*")
@@ -347,11 +271,9 @@ def get_all_open_student_rows() -> List[Dict[str, Any]]:
 
 
 def close_all_stale_open_rows() -> int:
-    """
-    Close all open rows whose check_in_at is from a previous day.
-    """
-    rows = get_all_open_student_rows()
+    rows = get_all_open_rows()
     count = 0
+    today = now_local().date()
 
     for row in rows:
         student_id = row.get("id")
@@ -364,33 +286,34 @@ def close_all_stale_open_rows() -> int:
         if check_in_dt is None:
             continue
 
-        if is_same_local_day(check_in_dt, today_local()):
+        if check_in_dt.date() == today:
             continue
 
-        auto_close_timestamp = end_of_day_iso(check_in_dt.date())
+        close_ts = end_of_day_iso(check_in_dt.date())
 
-        update_student_times(
-            student_id=student_id,
-            check_in_at=None,
-            check_out_at=auto_close_timestamp
+        (
+            supabase.table(STUDENTS_TABLE)
+            .update({
+                "check_out_at": close_ts
+            })
+            .eq("id", student_id)
+            .execute()
         )
-        log_status(student_id, "checked_out", auto_close_timestamp)
+
+        log_status(student_id, "checked_out", close_ts)
         count += 1
 
     return count
 
 
 def close_all_open_rows_for_today_if_needed() -> int:
-    """
-    After the configured cutoff time, close every student still checked in today.
-    """
     now_dt = now_local()
     cutoff_dt = datetime.combine(now_dt.date(), dt_time(AUTO_CLOSE_HOUR, AUTO_CLOSE_MINUTE, 59))
 
     if now_dt < cutoff_dt:
         return 0
 
-    rows = get_all_open_student_rows()
+    rows = get_all_open_rows()
     count = 0
     close_ts = cutoff_dt.isoformat()
 
@@ -405,14 +328,18 @@ def close_all_open_rows_for_today_if_needed() -> int:
         if check_in_dt is None:
             continue
 
-        if not is_same_local_day(check_in_dt, today_local()):
+        if check_in_dt.date() != now_dt.date():
             continue
 
-        update_student_times(
-            student_id=student_id,
-            check_in_at=None,
-            check_out_at=close_ts
+        (
+            supabase.table(STUDENTS_TABLE)
+            .update({
+                "check_out_at": close_ts
+            })
+            .eq("id", student_id)
+            .execute()
         )
+
         log_status(student_id, "checked_out", close_ts)
         count += 1
 
@@ -422,23 +349,19 @@ def close_all_open_rows_for_today_if_needed() -> int:
 def auto_close_worker() -> None:
     while True:
         try:
-            closed_count = close_all_open_rows_for_today_if_needed()
-            if closed_count > 0:
-                print(f"[AUTO] Closed {closed_count} open record(s) for today.")
+            closed = close_all_open_rows_for_today_if_needed()
+            if closed > 0:
+                print(f"[AUTO] Closed {closed} open record(s) for today.")
         except Exception as e:
-            print(f"[AUTO] Error during end-of-day close: {e}")
+            print(f"[AUTO] Error: {e}")
 
         time.sleep(AUTO_CLOSE_CHECK_SECONDS)
 
 
-# =========================
-# Main program
-# =========================
-
 def startup_tasks() -> None:
-    stale_closed = close_all_stale_open_rows()
-    if stale_closed > 0:
-        print(f"[STARTUP] Closed {stale_closed} stale open record(s).")
+    closed = close_all_stale_open_rows()
+    if closed > 0:
+        print(f"[STARTUP] Closed {closed} stale open record(s).")
     else:
         print("[STARTUP] No stale open records found.")
 
@@ -466,7 +389,7 @@ def main() -> None:
             student_id = extract_student_id(raw)
 
             if not student_id:
-                print("[FAIL] Could not find a valid 10-digit student ID in swipe input.")
+                print("[FAIL] No valid 10-digit ID found.")
                 fail_blink()
                 continue
 
@@ -480,6 +403,12 @@ def main() -> None:
             fail_blink()
 
 
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        cleanup_gpio()
+PY
 if __name__ == "__main__":
     try:
         main()
