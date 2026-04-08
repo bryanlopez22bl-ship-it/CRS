@@ -45,6 +45,7 @@ GPIO_READY = False
 if ENABLE_LED:
     try:
         import RPi.GPIO as GPIO
+
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(LED_PIN, GPIO.OUT)
@@ -156,6 +157,11 @@ def find_swiper_device() -> InputDevice:
     raise RuntimeError(f"Could not find swiper device containing: {DEVICE_NAME_HINT}")
 
 
+def extract_student_id(text: str) -> Optional[str]:
+    match = re.search(r"\d{10}", text or "")
+    return match.group(0) if match else None
+
+
 def read_swipes_from_hid():
     device = find_swiper_device()
     print(f"[HID] Listening on {device.path}: {device.name}")
@@ -168,6 +174,7 @@ def read_swipes_from_hid():
 
         key_event = categorize(event)
 
+        # Only react on key press
         if key_event.keystate != 1:
             continue
 
@@ -175,23 +182,25 @@ def read_swipes_from_hid():
         if isinstance(keycode, list):
             keycode = keycode[0]
 
-        if keycode not in KEYMAP:
-            continue
-
-        char = KEYMAP[keycode]
-
-        if char == "\n":
+        if keycode in ("KEY_ENTER", "KEY_KPENTER"):
             raw = buffer.strip()
             buffer = ""
-            if raw:
-                yield raw
-        else:
-            buffer += char
 
+            if not raw:
+                continue
 
-def extract_student_id(raw_swipe: str) -> Optional[str]:
-    match = re.search(r"\d{10}", raw_swipe or "")
-    return match.group(0) if match else None
+            student_id = extract_student_id(raw)
+            if student_id:
+                yield student_id
+            else:
+                print(f"[FAIL] No valid 10-digit ID found in swipe: {raw}")
+                fail_blink()
+            continue
+
+        if keycode in KEYMAP:
+            char = KEYMAP[keycode]
+            if char != "\n":
+                buffer += char
 
 
 # =========================
@@ -213,7 +222,9 @@ def get_events_for_date(target_date: date) -> List[dict]:
     return response.data or []
 
 
-def get_latest_event_for_student_today(student_id: str, target_date: Optional[date] = None) -> Optional[dict]:
+def get_latest_event_for_student_today(
+    student_id: str, target_date: Optional[date] = None
+) -> Optional[dict]:
     if target_date is None:
         target_date = now_local().date()
 
@@ -242,11 +253,15 @@ def is_tutor(student_id: str) -> bool:
         .limit(1)
         .execute()
     )
-
     return bool(response.data)
 
 
-def insert_swipe_event(student_id: str, is_tutor_flag: bool, event_type: str, timestamp_iso: Optional[str] = None) -> None:
+def insert_swipe_event(
+    student_id: str,
+    is_tutor_flag: bool,
+    event_type: str,
+    timestamp_iso: Optional[str] = None,
+) -> None:
     if timestamp_iso is None:
         timestamp_iso = iso_now()
 
@@ -255,12 +270,14 @@ def insert_swipe_event(student_id: str, is_tutor_flag: bool, event_type: str, ti
 
     (
         supabase.table(SWIPE_TABLE)
-        .insert({
-            "student_id": student_id,
-            "isTutor": is_tutor_flag,
-            "event_type": event_type,
-            "created_at": timestamp_iso
-        })
+        .insert(
+            {
+                "student_id": student_id,
+                "isTutor": is_tutor_flag,
+                "event_type": event_type,
+                "created_at": timestamp_iso,
+            }
+        )
         .execute()
     )
 
@@ -290,18 +307,17 @@ def calculate_daily_metrics(target_date: date):
         if tutor_flag:
             if event_type == "IN":
                 tutor_open_in[student_id] = event_dt
-            elif event_type == "OUT":
-                if student_id in tutor_open_in:
-                    total_tutor_seconds += (event_dt - tutor_open_in[student_id]).total_seconds()
-                    del tutor_open_in[student_id]
+            elif event_type == "OUT" and student_id in tutor_open_in:
+                total_tutor_seconds += (
+                    event_dt - tutor_open_in[student_id]
+                ).total_seconds()
+                del tutor_open_in[student_id]
 
     current_occupancy = sum(
-        1 for event in latest_by_student.values()
-        if event.get("event_type") == "IN"
+        1 for event in latest_by_student.values() if event.get("event_type") == "IN"
     )
 
     total_tutor_hours = round(total_tutor_seconds / 3600.0, 2)
-
     return current_occupancy, total_tutor_hours
 
 
@@ -310,11 +326,13 @@ def update_daily_tracking(target_date: date) -> None:
 
     (
         supabase.table(DAILY_TABLE)
-        .upsert({
-            "date": target_date.isoformat(),
-            "number_of_occupancy": occupancy,
-            "total_tutoring_hours": tutor_hours
-        })
+        .upsert(
+            {
+                "date": target_date.isoformat(),
+                "number_of_occupancy": occupancy,
+                "total_tutoring_hours": tutor_hours,
+            }
+        )
         .execute()
     )
 
@@ -352,10 +370,7 @@ def get_students_still_in_for_date(target_date: date) -> List[dict]:
     for event in events:
         latest_by_student[str(event["student_id"])] = event
 
-    return [
-        event for event in latest_by_student.values()
-        if event.get("event_type") == "IN"
-    ]
+    return [event for event in latest_by_student.values() if event.get("event_type") == "IN"]
 
 
 def auto_close_date(target_date: date) -> int:
@@ -368,7 +383,7 @@ def auto_close_date(target_date: date) -> int:
             student_id=str(event["student_id"]),
             is_tutor_flag=bool(event.get("isTutor", False)),
             event_type="OUT",
-            timestamp_iso=cutoff_iso
+            timestamp_iso=cutoff_iso,
         )
         count += 1
 
@@ -385,17 +400,20 @@ def startup_tasks() -> None:
     today = now_local().date()
     yesterday = today - timedelta(days=1)
 
-    closed_yesterday = auto_close_date(yesterday)
-    if closed_yesterday > 0:
-        print(f"[STARTUP] Auto-closed {closed_yesterday} open record(s) for {yesterday}.")
-    else:
-        print("[STARTUP] No stale open records found.")
+    try:
+        closed_yesterday = auto_close_date(yesterday)
+        if closed_yesterday > 0:
+            print(f"[STARTUP] Auto-closed {closed_yesterday} open record(s) for {yesterday}.")
+        else:
+            print("[STARTUP] No stale open records found.")
 
-    if now_local() >= end_of_day(today):
-        closed_today = auto_close_date(today)
-        _last_auto_closed_date = today
-        if closed_today > 0:
-            print(f"[STARTUP] Auto-closed {closed_today} open record(s) for today.")
+        if now_local() >= end_of_day(today):
+            closed_today = auto_close_date(today)
+            _last_auto_closed_date = today
+            if closed_today > 0:
+                print(f"[STARTUP] Auto-closed {closed_today} open record(s) for today.")
+    except Exception as e:
+        print(f"[STARTUP] Supabase not ready yet: {e}")
 
 
 def auto_close_worker() -> None:
@@ -426,28 +444,15 @@ def main() -> None:
 
     print("Swipe system ready.")
 
-    for raw in read_swipes_from_hid():
+    for student_id in read_swipes_from_hid():
         try:
-            print(f"[RAW] {raw}")
-
-            student_id = extract_student_id(raw)
-            if not student_id:
-                print("[FAIL] No valid 10-digit ID found.")
-                fail_blink()
-                continue
-
+            print(f"[RAW] {student_id}")
             process_swipe(student_id)
-
         except Exception as e:
             print(f"[ERROR] {e}")
             fail_blink()
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        cleanup_gpio()
 if __name__ == "__main__":
     try:
         main()
