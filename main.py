@@ -174,7 +174,6 @@ def read_swipes_from_hid():
 
         key_event = categorize(event)
 
-        # only key-down events
         if key_event.keystate != 1:
             continue
 
@@ -291,6 +290,7 @@ def calculate_daily_metrics(target_date: date):
 
     in_count = 0
     out_count = 0
+    total_visits = 0
 
     tutor_open_in: Dict[str, datetime] = {}
     total_tutor_seconds = 0.0
@@ -303,6 +303,7 @@ def calculate_daily_metrics(target_date: date):
 
         if event_type == "IN":
             in_count += 1
+            total_visits += 1
         elif event_type == "OUT":
             out_count += 1
 
@@ -321,11 +322,11 @@ def calculate_daily_metrics(target_date: date):
     current_occupancy = max(in_count - out_count, 0)
     total_tutor_hours = round(total_tutor_seconds / 3600.0, 2)
 
-    return current_occupancy, total_tutor_hours
+    return current_occupancy, total_tutor_hours, total_visits
 
 
 def update_daily_tracking(target_date: date) -> None:
-    occupancy, tutor_hours = calculate_daily_metrics(target_date)
+    occupancy, tutor_hours, total_visits = calculate_daily_metrics(target_date)
 
     (
         supabase.table(DAILY_TABLE)
@@ -334,6 +335,7 @@ def update_daily_tracking(target_date: date) -> None:
                 "date": target_date.isoformat(),
                 "number_of_occupancy": occupancy,
                 "total_tutoring_hours": tutor_hours,
+                "total_visits": total_visits,
             }
         )
         .execute()
@@ -464,12 +466,6 @@ def main() -> None:
             print(f"[ERROR] {e}")
             fail_blink()
 
-
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        cleanup_gpio()
 
 if __name__ == "__main__":
     try:
