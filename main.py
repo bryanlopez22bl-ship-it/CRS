@@ -174,7 +174,7 @@ def read_swipes_from_hid():
 
         key_event = categorize(event)
 
-        # Only react on key press
+        # only key-down events
         if key_event.keystate != 1:
             continue
 
@@ -289,7 +289,9 @@ def insert_swipe_event(
 def calculate_daily_metrics(target_date: date):
     events = get_events_for_date(target_date)
 
-    latest_by_student: Dict[str, dict] = {}
+    in_count = 0
+    out_count = 0
+
     tutor_open_in: Dict[str, datetime] = {}
     total_tutor_seconds = 0.0
 
@@ -299,10 +301,13 @@ def calculate_daily_metrics(target_date: date):
         event_dt = parse_dt(event["created_at"])
         tutor_flag = bool(event.get("isTutor", False))
 
+        if event_type == "IN":
+            in_count += 1
+        elif event_type == "OUT":
+            out_count += 1
+
         if event_dt is None:
             continue
-
-        latest_by_student[student_id] = event
 
         if tutor_flag:
             if event_type == "IN":
@@ -313,11 +318,9 @@ def calculate_daily_metrics(target_date: date):
                 ).total_seconds()
                 del tutor_open_in[student_id]
 
-    current_occupancy = sum(
-        1 for event in latest_by_student.values() if event.get("event_type") == "IN"
-    )
-
+    current_occupancy = max(in_count - out_count, 0)
     total_tutor_hours = round(total_tutor_seconds / 3600.0, 2)
+
     return current_occupancy, total_tutor_hours
 
 
@@ -370,7 +373,11 @@ def get_students_still_in_for_date(target_date: date) -> List[dict]:
     for event in events:
         latest_by_student[str(event["student_id"])] = event
 
-    return [event for event in latest_by_student.values() if event.get("event_type") == "IN"]
+    return [
+        event
+        for event in latest_by_student.values()
+        if event.get("event_type") == "IN"
+    ]
 
 
 def auto_close_date(target_date: date) -> int:
@@ -379,12 +386,17 @@ def auto_close_date(target_date: date) -> int:
 
     count = 0
     for event in still_in:
+        student_id = str(event["student_id"])
+        tutor_flag = bool(event.get("isTutor", False))
+
         insert_swipe_event(
-            student_id=str(event["student_id"]),
-            is_tutor_flag=bool(event.get("isTutor", False)),
+            student_id=student_id,
+            is_tutor_flag=tutor_flag,
             event_type="OUT",
             timestamp_iso=cutoff_iso,
         )
+
+        print(f"[AUTO-OUT] {student_id} -> OUT at {cutoff_iso}")
         count += 1
 
     update_daily_tracking(target_date)
@@ -452,6 +464,12 @@ def main() -> None:
             print(f"[ERROR] {e}")
             fail_blink()
 
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        cleanup_gpio()
 
 if __name__ == "__main__":
     try:
